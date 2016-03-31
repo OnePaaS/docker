@@ -1,72 +1,95 @@
 package client
 
 import (
-	"encoding/json"
-	"fmt"
 	"runtime"
+	"text/template"
+	"time"
 
-	"github.com/docker/docker/api"
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/autogen/dockerversion"
+	"golang.org/x/net/context"
+
+	Cli "github.com/docker/docker/cli"
+	"github.com/docker/docker/dockerversion"
 	flag "github.com/docker/docker/pkg/mflag"
 	"github.com/docker/docker/utils"
+	"github.com/docker/docker/utils/templates"
+	"github.com/docker/engine-api/types"
 )
+
+var versionTemplate = `Client:
+ Version:      {{.Client.Version}}
+ API version:  {{.Client.APIVersion}}
+ Go version:   {{.Client.GoVersion}}
+ Git commit:   {{.Client.GitCommit}}
+ Built:        {{.Client.BuildTime}}
+ OS/Arch:      {{.Client.Os}}/{{.Client.Arch}}{{if .Client.Experimental}}
+ Experimental: {{.Client.Experimental}}{{end}}{{if .ServerOK}}
+
+Server:
+ Version:      {{.Server.Version}}
+ API version:  {{.Server.APIVersion}}
+ Go version:   {{.Server.GoVersion}}
+ Git commit:   {{.Server.GitCommit}}
+ Built:        {{.Server.BuildTime}}
+ OS/Arch:      {{.Server.Os}}/{{.Server.Arch}}{{if .Server.Experimental}}
+ Experimental: {{.Server.Experimental}}{{end}}{{end}}`
 
 // CmdVersion shows Docker version information.
 //
 // Available version information is shown for: client Docker version, client API version, client Go version, client Git commit, client OS/Arch, server Docker version, server API version, server Go version, server Git commit, and server OS/Arch.
 //
 // Usage: docker version
-func (cli *DockerCli) CmdVersion(args ...string) error {
-	cmd := cli.Subcmd("version", nil, "Show the Docker version information.", true)
+func (cli *DockerCli) CmdVersion(args ...string) (err error) {
+	cmd := Cli.Subcmd("version", nil, Cli.DockerCommands["version"].Description, true)
+	tmplStr := cmd.String([]string{"f", "#format", "-format"}, "", "Format the output using the given go template")
 	cmd.Require(flag.Exact, 0)
 
 	cmd.ParseFlags(args, true)
 
-	fmt.Println("Client:")
-	if dockerversion.VERSION != "" {
-		fmt.Fprintf(cli.out, " Version:      %s\n", dockerversion.VERSION)
-	}
-	fmt.Fprintf(cli.out, " API version:  %s\n", api.Version)
-	fmt.Fprintf(cli.out, " Go version:   %s\n", runtime.Version())
-	if dockerversion.GITCOMMIT != "" {
-		fmt.Fprintf(cli.out, " Git commit:   %s\n", dockerversion.GITCOMMIT)
-	}
-	if dockerversion.BUILDTIME != "" {
-		fmt.Fprintf(cli.out, " Built:        %s\n", dockerversion.BUILDTIME)
-	}
-	fmt.Fprintf(cli.out, " OS/Arch:      %s/%s\n", runtime.GOOS, runtime.GOARCH)
-	if utils.ExperimentalBuild() {
-		fmt.Fprintf(cli.out, " Experimental: true\n")
+	templateFormat := versionTemplate
+	if *tmplStr != "" {
+		templateFormat = *tmplStr
 	}
 
-	stream, _, _, err := cli.call("GET", "/version", nil, nil)
-	if err != nil {
-		return err
+	var tmpl *template.Template
+	if tmpl, err = templates.Parse(templateFormat); err != nil {
+		return Cli.StatusError{StatusCode: 64,
+			Status: "Template parsing error: " + err.Error()}
 	}
 
-	defer stream.Close()
-
-	var v types.Version
-	if err := json.NewDecoder(stream).Decode(&v); err != nil {
-		fmt.Fprintf(cli.err, "Error reading remote version: %s\n", err)
-		return err
+	vd := types.VersionResponse{
+		Client: &types.Version{
+			Version:      dockerversion.Version,
+			APIVersion:   cli.client.ClientVersion(),
+			GoVersion:    runtime.Version(),
+			GitCommit:    dockerversion.GitCommit,
+			BuildTime:    dockerversion.BuildTime,
+			Os:           runtime.GOOS,
+			Arch:         runtime.GOARCH,
+			Experimental: utils.ExperimentalBuild(),
+		},
 	}
 
-	fmt.Println("\nServer:")
-	fmt.Fprintf(cli.out, " Version:      %s\n", v.Version)
-	if v.ApiVersion != "" {
-		fmt.Fprintf(cli.out, " API version:  %s\n", v.ApiVersion)
+	serverVersion, err := cli.client.ServerVersion(context.Background())
+	if err == nil {
+		vd.Server = &serverVersion
 	}
-	fmt.Fprintf(cli.out, " Go version:   %s\n", v.GoVersion)
-	fmt.Fprintf(cli.out, " Git commit:   %s\n", v.GitCommit)
-	if len(v.BuildTime) > 0 {
-		fmt.Fprintf(cli.out, " Built:        %s\n", v.BuildTime)
+
+	// first we need to make BuildTime more human friendly
+	t, errTime := time.Parse(time.RFC3339Nano, vd.Client.BuildTime)
+	if errTime == nil {
+		vd.Client.BuildTime = t.Format(time.ANSIC)
 	}
-	fmt.Fprintf(cli.out, " OS/Arch:      %s/%s\n", v.Os, v.Arch)
-	if v.Experimental {
-		fmt.Fprintf(cli.out, " Experimental: true\n")
+
+	if vd.ServerOK() {
+		t, errTime = time.Parse(time.RFC3339Nano, vd.Server.BuildTime)
+		if errTime == nil {
+			vd.Server.BuildTime = t.Format(time.ANSIC)
+		}
 	}
-	fmt.Fprintf(cli.out, "\n")
-	return nil
+
+	if err2 := tmpl.Execute(cli.out, vd); err2 != nil && err == nil {
+		err = err2
+	}
+	cli.out.Write([]byte{'\n'})
+	return err
 }
